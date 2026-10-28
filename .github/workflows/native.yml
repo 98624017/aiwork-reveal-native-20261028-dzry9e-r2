@@ -1,0 +1,153 @@
+name: Native reveal validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_revision:
+        description: Exact encrypted snapshot revision
+        required: true
+        type: string
+      capsule_sha256:
+        description: SHA-256 of candidate.capsule
+        required: true
+        type: string
+      targets:
+        description: all or a comma-separated subset of windows-x64,macos-arm64,macos-x64
+        required: true
+        default: all
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Validate requested native targets
+        id: targets
+        shell: bash
+        env:
+          REQUESTED_TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          matrix=$(node capsule.mjs plan --targets "$REQUESTED_TARGETS")
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+  native:
+    name: native-${{ matrix.target }}
+    if: github.actor == github.repository_owner
+    needs: plan
+    concurrency:
+      group: native-reveal-${{ matrix.target }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      NATIVE_TARGET_PLATFORM: ${{ matrix.platform }}
+      NATIVE_TARGET_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Authenticate and open candidate
+        timeout-minutes: 5
+        shell: bash
+        env:
+          CAPSULE_KEY: ${{ secrets.CAPSULE_KEY }}
+          CAPSULE_SHA256: ${{ inputs.capsule_sha256 }}
+          CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$CAPSULE_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$CANDIDATE_REVISION" =~ ^[a-f0-9]{40}$ ]]
+          node -e 'const assert = require("node:assert/strict"); assert.match(process.version, /^v22\./); assert.equal(process.platform, process.env.NATIVE_TARGET_PLATFORM); assert.equal(process.arch, process.env.NATIVE_TARGET_ARCH);'
+          printf '%s' "$CAPSULE_KEY" | node capsule.mjs open --bundle candidate.capsule --output "$RUNNER_TEMP/candidate.bundle" --expected-sha256 "$CAPSULE_SHA256"
+          git clone --quiet --branch main --config core.autocrlf=false "$RUNNER_TEMP/candidate.bundle" "$RUNNER_TEMP/candidate" 2> "$RUNNER_TEMP/private-clone.log"
+          test "$(git -C "$RUNNER_TEMP/candidate" rev-parse HEAD)" = "$CANDIDATE_REVISION"
+      - name: Build development runtime and validate native reveal
+        timeout-minutes: 18
+        shell: bash
+        env:
+          NATIVE_CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
+          NATIVE_CAPSULE_SHA256: ${{ inputs.capsule_sha256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          node "$RUNNER_TEMP/candidate/scripts/reveal-native-validation/run.mjs" > "$RUNNER_TEMP/private-validation.log" 2>&1
+      - name: Collect private evidence
+        id: collect
+        if: always()
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/reveal-evidence"
+          for name in private-validation.log private-clone.log; do
+            if [[ -f "$RUNNER_TEMP/$name" ]]; then cp "$RUNNER_TEMP/$name" "$RUNNER_TEMP/reveal-evidence/"; fi
+          done
+          if [[ -d "$RUNNER_TEMP/reveal-private" ]]; then
+            for name in commands.log playwright.json; do
+              if [[ -f "$RUNNER_TEMP/reveal-private/$name" ]]; then cp "$RUNNER_TEMP/reveal-private/$name" "$RUNNER_TEMP/reveal-evidence/"; fi
+            done
+          fi
+          if [[ -d "$RUNNER_TEMP/candidate/e2e/test-results-reveal-native" ]]; then
+            cp -R "$RUNNER_TEMP/candidate/e2e/test-results-reveal-native" "$RUNNER_TEMP/reveal-evidence/test-results"
+          fi
+          cd "$RUNNER_TEMP"
+          tar -czf reveal-evidence.tar.gz -C reveal-evidence . 2> private-archive.log
+      - name: Encrypt private evidence
+        if: always()
+        timeout-minutes: 3
+        shell: bash
+        env:
+          CAPSULE_KEY: ${{ secrets.CAPSULE_KEY }}
+          CAPSULE_SHA256: ${{ inputs.capsule_sha256 }}
+          ARCHIVE_OUTCOME: ${{ steps.collect.outcome }}
+        run: |
+          set -euo pipefail
+          umask 077
+          node --input-type=module -e 'import { readFileSync } from "node:fs"; import { openCapsule } from "./capsule.mjs"; try { openCapsule(readFileSync("candidate.capsule"), process.env.CAPSULE_KEY.trim(), process.env.CAPSULE_SHA256); } catch { console.error("Evidence key does not match the dispatched candidate"); process.exit(1); }'
+          mkdir -p "$RUNNER_TEMP/public-report"
+          if [[ -s "$RUNNER_TEMP/private-archive.log" ]]; then
+            printf '%s' "$CAPSULE_KEY" | node capsule.mjs seal-with-key --bundle "$RUNNER_TEMP/private-archive.log" --output "$RUNNER_TEMP/public-report/private-archive-log.capsule"
+          fi
+          if [[ "$ARCHIVE_OUTCOME" == success ]]; then
+            printf '%s' "$CAPSULE_KEY" | node capsule.mjs seal-with-key --bundle "$RUNNER_TEMP/reveal-evidence.tar.gz" --output "$RUNNER_TEMP/public-report/private-evidence.capsule"
+          fi
+      - name: Upload sanitized report and encrypted evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-reveal-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/public-report/native-reveal.json
+            ${{ runner.temp }}/public-report/private-evidence.capsule
+            ${{ runner.temp }}/public-report/private-archive-log.capsule
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove private candidate and plaintext evidence
+        if: always()
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          node --input-type=module -e 'import { rm } from "node:fs/promises"; import path from "node:path"; const root = process.env.RUNNER_TEMP; if (!root || !path.isAbsolute(root) || path.resolve(root) === path.parse(path.resolve(root)).root) throw new Error("Missing runner temp"); for (const name of ["candidate", "candidate.bundle", "reveal-private", "reveal-evidence", "reveal-evidence.tar.gz", "private-clone.log", "private-validation.log", "private-archive.log"]) await rm(path.join(root, name), { recursive: ["candidate", "reveal-private", "reveal-evidence"].includes(name), force: true });'
